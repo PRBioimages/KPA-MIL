@@ -1,10 +1,10 @@
-# KPA-MIL
+# KP-MIL
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-### KPA-MIL: Knowledge-Prompted Auxiliary-task Multiple Instance Learning for Whole Slide Image Analysis
+### KP-MIL: Clinical knowledge-prompted multiple instance learning from whole-slide images for complex pathological tasks
 
-KPA-MIL is a multi-task multiple instance learning (MIL) framework for whole slide image (WSI) analysis. The main task never consumes text directly; instead, clinical knowledge is injected **indirectly** through text-prompt-guided auxiliary tasks, where each auxiliary label is paired with a natural-language prompt encoded by a pathology vision-language model (CONCH). A cross-scale contrastive objective further aligns global features aggregated from the low- and high-resolution branches. KPA-MIL was validated on 5 real-world pathology datasets (TJ, CRC-OS, CRC-PFS, GMU, SR386), supporting both classification and survival analysis paradigms.
+KP-MIL is a multi-task multiple instance learning (MIL) framework for whole slide image (WSI) analysis. The main task never consumes text directly; instead, clinical knowledge is injected **indirectly** through text-prompt-guided auxiliary tasks, where each auxiliary label is paired with a natural-language prompt encoded by a pathology vision-language model (CONCH). A cross-scale contrastive objective further aligns global features aggregated from the low- and high-resolution branches. KP-MIL was validated on 5 real-world pathology datasets (TJ, CRC-OS, CRC-PFS, GMU, SR386), supporting both classification and survival analysis paradigms.
 
 🔬 Key Features:
 
@@ -20,7 +20,7 @@ KPA-MIL is a multi-task multiple instance learning (MIL) framework for whole sli
 ## Project Structure
 
 ```
-KPA-MIL/
+KP-MIL/
 ├── main_MTL.py                  # Main training entry point (multi-task)
 ├── run_experiments.sh           # All 9 experiment configurations used in the paper
 ├── create_patches_fp.py         # WSI patch extraction (CLAM pipeline)
@@ -83,7 +83,7 @@ Five real-world pathology cohorts are used in this study:
 
 Text prompts for the auxiliary labels are stored under `text_prompt/`, one CSV per dataset. Each row corresponds to one slide (case), and each column provides the prompt of one auxiliary task.
 
-## Training KPA-MIL
+## Training KP-MIL
 
 ### 1. Environment
 
@@ -215,7 +215,7 @@ If you use this code, please cite our paper (currently under review):
 
 ```bibtex
 @article{kpamil2025,
-  title={KPA-MIL: Knowledge-Prompted Auxiliary-task Multiple Instance Learning for Whole Slide Image Analysis},
+  title={KP-MIL: Knowledge-Prompted Auxiliary-task Multiple Instance Learning for Whole Slide Image Analysis},
   author={To be updated},
   journal={To be updated},
   year={2025},
