@@ -131,7 +131,9 @@ class IPWCIndexMeter(object):
 
     def value(self):
         kmf = KaplanMeierFitter()
-        kmf.fit(self.t, event_observed=self.labels)
+        # IPCW 的 G 必须是删失分布 P(C>t)，故用 (1 - labels)；
+        # labels 是事件指示(1=事件)，直接传 labels 会使 1/G^2 权重失真。
+        kmf.fit(self.t, event_observed=(1 - self.labels))
         G_T = kmf.predict(self.t, interpolate=True).to_numpy()
         G_T[G_T == 0] = self.eps / 2
         inv_G_T_square = 1. / G_T**2
@@ -214,7 +216,10 @@ class BrierScoreMeter(object):
     def value(self):
         S = self.survival_seqs
         kmf = KaplanMeierFitter()
-        kmf.fit(self.t, event_observed=self.labels)
+        # IPCW-Brier 的 G 必须是删失分布 P(C>t)，故用 (1 - labels)。
+        # labels 是事件指示(1=事件)；直接传 labels 会得到"事件生存函数"，
+        # 使 1/G 权重随随访衰减而爆炸，IBS 虚高且不可跨数据集比较。
+        kmf.fit(self.t, event_observed=(1 - self.labels))
         G_T = kmf.predict(self.t, interpolate=True).to_numpy()
 
         t_span = np.linspace(self.t.min(), max(self.t[G_T > self.eps]),
