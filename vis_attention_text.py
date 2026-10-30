@@ -67,16 +67,22 @@ class TextAttentionExtractor:
         if isinstance(output, tuple) and len(output) == 2:
             attn_output, attn_weights = output
             if attn_weights is not None:
+                # MultiheadAttention 默认 need_raw=True，返回的是 softmax 之前的 QK^T 原始打分。
+                # 同时保存两份：prob 为真正的注意力概率，raw 供差分模式使用。
                 key = f'text_attn_{name}_{scale_name}'
-                self.attention_weights[key] = attn_weights.detach()
+                self.attention_weights[key + '_raw'] = attn_weights.detach()
+                self.attention_weights[key] = torch.softmax(attn_weights, dim=-1).detach()
 
     def remove_hooks(self):
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
 
-    def get_attention(self, task_idx, scale='low'):
+    def get_attention(self, task_idx, scale='low', mode='prob'):
         key = f'text_attn_{task_idx}_{scale}'
+        if mode in ('raw', 'diff'):
+            # 差分需要 softmax 前的打分，类共享项 q̄·k_j 才能精确抵消
+            key += '_raw'
         return self.attention_weights.get(key, None)
 
     def clear(self):
@@ -188,7 +194,7 @@ def build_task_configs_from_prompts(text_prompt_file, aux_label_cols, aux_task_n
 
 
 def load_model(ckpt_path, model_type='ViLa_MTL_MIL',
-               text_prompt_file=None, aux_label_cols=None):
+               text_prompt_file=None, aux_label_cols=None, seed=0):
     """Load ViLa-MIL model from checkpoint."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -275,11 +281,29 @@ def load_model(ckpt_path, model_type='ViLa_MTL_MIL',
             zero_shot_config={},
         )
         
+        # 仅固定“未被 checkpoint 覆盖的层”的随机初始化；不参与任何可视化计算
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
         model = ViLa_MTL_MIL_Model(config)
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
     
-    model.load_state_dict(state_dict_clean, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict_clean, strict=False)
+    trainable_names = {n for n, p in model.named_parameters() if p.requires_grad}
+    missing_trainable = sorted(k for k in missing_keys if k in trainable_names)
+    if missing_trainable:
+        raise RuntimeError(
+            "checkpoint 缺少可训练参数（这些层将使用随机初始化，可视化结果不可信）:\n  "
+            + "\n  ".join(missing_trainable[:20])
+            + "\n旧版保存逻辑 get_trainable_state_dict() 排除了所有 text_encoder.* 参数，"
+              "因此 text_encoder.projection 是最常见的缺失项；"
+              "需用修复后的保存逻辑重新训练并重新导出 checkpoint。"
+        )
+    print(f"[Load] missing={len(missing_keys)} (均为冻结的 CONCH 主干，从预训练权重重新加载), "
+          f"missing_trainable=0, unexpected={len(unexpected_keys)}")
     model = model.to(device)
     model.eval()
     
@@ -309,10 +333,12 @@ def load_h5_features(h5_path):
     return features, coords, patch_size, patch_level
 
 
-def get_text_attention(model, features_s, coords_s, features_l, coords_l, task_idx=0):
+def get_text_attention(model, features_s, coords_s, features_l, coords_l, task_idx=0,
+                       attn_mode='prob'):
     """Get text-to-patch attention weights using hooks.
-    
+
     Returns both low-res and high-res attention (cross_attention_text is called twice).
+    attn_mode: 'prob' 返回 softmax 注意力概率，'raw'/'diff' 返回 softmax 前打分。
     """
     device = next(model.parameters()).device
 
@@ -331,19 +357,126 @@ def get_text_attention(model, features_s, coords_s, features_l, coords_l, task_i
         outputs = model([features_s.squeeze(0)], [coords_s.squeeze(0)],
                        [features_l.squeeze(0)], [coords_l.squeeze(0)])
 
-    attn_low = extractor.get_attention(task_idx, scale='low')
-    attn_high = extractor.get_attention(task_idx, scale='high')
+    attn_low = extractor.get_attention(task_idx, scale='low', mode=attn_mode)
+    attn_high = extractor.get_attention(task_idx, scale='high', mode=attn_mode)
 
     extractor.remove_hooks()
 
     return attn_low, attn_high, coords_s, coords_l
 
 
+def _forward_aux_probs(model, features_s, coords_s, features_l, coords_l):
+    """一次前向，返回所有辅助任务的类别概率（list of np.ndarray）。"""
+    with torch.no_grad():
+        outputs = model([features_s], [coords_s], [features_l], [coords_l])
+    if not outputs.get('aux_tasks'):
+        raise RuntimeError('模型未返回 aux_tasks（请确认 --use_text_prompts 为真）')
+    return [t['prob'][0].detach().float().cpu().numpy() for t in outputs['aux_tasks']]
+
+
+def compute_occlusion_scores(model, features_s, coords_s, features_l, coords_l,
+                             task_idx=0, scale='low', grid=16):
+    """遮挡归因：逐网格块把 patch 特征置零，测量各类概率的下降量。
+
+    返回:
+      scores_list[c]      : 长度 num_patches 的有符号数组（正=支撑该类）
+      base_prob           : 完整输入下的类别概率
+      class_mean_delta    : 各类在有效网格块上的平均概率变化
+    """
+    device = next(model.parameters()).device
+    fs = features_s.to(device).float()
+    fl = features_l.to(device).float()
+    cs = coords_s.to(device).float()
+    cl = coords_l.to(device).float()
+    target_f, target_c = (fs, cs) if scale == 'low' else (fl, cl)
+
+    base_prob = _forward_aux_probs(model, fs, cs, fl, cl)[task_idx]
+    num_classes = base_prob.shape[0]
+
+    c0, c1 = target_c[:, 0], target_c[:, 1]
+    xmin, xmax = float(c0.min()), float(c0.max())
+    ymin, ymax = float(c1.min()), float(c1.max())
+    gx = torch.clamp(((c0 - xmin) / max(xmax - xmin, 1e-6) * grid).long(), 0, grid - 1)
+    gy = torch.clamp(((c1 - ymin) / max(ymax - ymin, 1e-6) * grid).long(), 0, grid - 1)
+    cell_id = (gx * grid + gy).cpu().numpy()
+
+    cell_delta = np.zeros((grid * grid, num_classes), dtype=np.float32)
+    used = np.unique(cell_id)
+    for cid in used:
+        mask = torch.from_numpy(cell_id == cid).to(device)
+        fs_m, fl_m = fs.clone(), fl
+        if scale == 'low':
+            fs_m[mask] = 0.0
+        else:
+            fs_m, fl_m = fs, fl.clone()
+            fl_m[mask] = 0.0
+        p_occ = _forward_aux_probs(model, fs_m, cs, fl_m, cl)[task_idx]
+        cell_delta[int(cid)] = base_prob - p_occ
+
+    scores = [cell_delta[cell_id, c] for c in range(num_classes)]
+    class_mean_delta = cell_delta[used].mean(axis=0)
+    return scores, base_prob, class_mean_delta
+def _forward_aux_probs_batch(model, fs_list, cs_list, fl_list, cl_list):
+    """批量前向（每个样本可以是不同的遮挡版本），返回各辅助任务概率 [B, C]。"""
+    with torch.no_grad():
+        outputs = model(fs_list, cs_list, fl_list, cl_list)
+    if not outputs.get('aux_tasks'):
+        raise RuntimeError('模型未返回 aux_tasks（请确认 --use_text_prompts 为真）')
+    return [t['prob'].detach().float().cpu().numpy() for t in outputs['aux_tasks']]
+
+
+def compute_patch_occlusion_scores(model, features_s, coords_s, features_l, coords_l,
+                                   task_idx=0, scale='low', batch_size=8, score='logprob'):
+    """patch 级遮挡归因：每次只把一个 patch 特征置零，测量各类概率/对数概率的变化。
+
+    返回:
+      scores_list[c] : 长度 num_patches 的有符号数组（正=支撑该类）
+      base_prob      : 完整输入下的类别概率
+      class_mean     : 各类在所有 patch 上的平均变化
+    """
+    device = next(model.parameters()).device
+    fs = features_s.to(device).float()
+    fl = features_l.to(device).float()
+    cs = coords_s.to(device)
+    cl = coords_l.to(device)
+    num_patches = (fs if scale == 'low' else fl).shape[0]
+
+    base_prob = _forward_aux_probs(model, fs, cs, fl, cl)[task_idx]
+    num_classes = base_prob.shape[0]
+
+    delta = np.zeros((num_patches, num_classes), dtype=np.float32)
+    for start in range(0, num_patches, batch_size):
+        idxs = list(range(start, min(start + batch_size, num_patches)))
+        fs_list, cs_list, fl_list, cl_list = [], [], [], []
+        for idx in idxs:
+            if scale == 'low':
+                fm_s, fm_l = fs.clone(), fl
+                fm_s[idx] = 0.0
+            else:
+                fm_s, fm_l = fs, fl.clone()
+                fm_l[idx] = 0.0
+            fs_list.append(fm_s)
+            fl_list.append(fm_l)
+            cs_list.append(cs)
+            cl_list.append(cl)
+        probs = _forward_aux_probs_batch(model, fs_list, cs_list, fl_list, cl_list)[task_idx]
+        if score == 'logprob':
+            delta[start:start + len(idxs)] = (np.log(base_prob + 1e-8)
+                                              - np.log(probs + 1e-8))
+        else:
+            delta[start:start + len(idxs)] = base_prob - probs
+
+    scores = [delta[:, c] for c in range(num_classes)]
+    class_mean = delta.mean(axis=0)
+    return scores, base_prob, class_mean
+
+
 def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
                             class_names=None, task_idx=0, vis_level=3, alpha=0.4,
                             cmap='jet', patch_size=256, patch_level=0, max_size=1024,
                             save_wsi=True, save_heatmap=True, heatmap_only=False,
-                            suffix='', shared_scale=False):
+                            suffix='', shared_scale=False, step_override=None,
+                            symmetric=False, attn_mode='prob'):
     """Draw separate heatmap for each text class (same coordinate logic as vis_attention.py).
 
     支持 OpenSlide (mrxs/svs/tif) 和 CZI (via aicspylibczi) 两种 WSI 格式。
@@ -352,6 +485,8 @@ def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
     import matplotlib.pyplot as plt
 
     os.makedirs(output_dir, exist_ok=True)
+    # 非默认模式加后缀，避免与 prob 图互相覆盖
+    mode_tag = '' if attn_mode == 'prob' else f'_{attn_mode}'
 
     # 根据扩展名选择 WSI 读取方式
     is_czi = wsi_path.lower().endswith('.czi')
@@ -421,6 +556,8 @@ def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
             y_step_original = patch_size
 
         step_size_original = max(x_step_original, y_step_original)
+        if step_override is not None:
+            step_size_original = step_override
         vis_patch_size = max(1, int(step_size_original / downsample * scale))
     else:
         vis_patch_size = max(1, int(patch_size * patch_downsample / downsample * scale))
@@ -469,6 +606,11 @@ def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
     if not save_heatmap:
         return
 
+    sym_vmax = 1.0
+    if symmetric and len(scores_list) > 0:
+        sym_vmax = max(float(np.abs(sc).max()) for sc in scores_list) or 1.0
+        print(f"  [diff] symmetric scale: +/-{sym_vmax:.6f} (blue=negative, red=positive)")
+
     shared_min = shared_max = None
     if shared_scale and len(scores_list) > 0:
         all_scores = np.concatenate([s.flatten() for s in scores_list])
@@ -484,7 +626,10 @@ def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
             class_name = f'class_{class_idx}'
 
         scores_flat = scores.flatten()
-        if shared_scale and shared_max is not None and shared_max > shared_min:
+        if symmetric:
+            # 差分图：对称归一化到 [-1, 1]，配合 bwr 色标（蓝=负、白=0、红=正）
+            scores_norm = np.clip((scores_flat + sym_vmax) / (2 * sym_vmax), 0.0, 1.0)
+        elif shared_scale and shared_max is not None and shared_max > shared_min:
             scores_norm = np.clip((scores_flat - shared_min) / (shared_max - shared_min), 0.0, 1.0)
         elif scores_flat.max() > scores_flat.min():
             scores_norm = (scores_flat - scores_flat.min()) / (scores_flat.max() - scores_flat.min())
@@ -507,29 +652,81 @@ def draw_heatmap_per_class(scores_list, coords, wsi_path, output_dir,
                 drawn_count += 1
 
         if heatmap_only:
-            output_path = os.path.join(output_dir, f'task{task_idx}{suffix}_{class_name}.png')
+            output_path = os.path.join(output_dir, f'task{task_idx}{suffix}_{class_name}{mode_tag}.png')
             Image.fromarray((heatmap * 255).astype(np.uint8)).save(output_path)
         else:
             mask = np.any(heatmap > 0, axis=2)
             overlay = wsi_img_np.copy()
             overlay[mask, :3] = wsi_img_np[mask, :3] * (1 - alpha) + heatmap[mask, :3] * alpha
-            output_path = os.path.join(output_dir, f'task{task_idx}{suffix}_{class_name}.png')
+            output_path = os.path.join(output_dir, f'task{task_idx}{suffix}_{class_name}{mode_tag}.png')
             Image.fromarray((overlay * 255).astype(np.uint8)).save(output_path, quality=85)
 
         print(f"  {class_name}: {drawn_count}/{len(coords_scaled)} patches drawn")
 
 
 
+_WSI_INDEX_CACHE = {}
+
+
+def build_wsi_index(wsi_dir, wsi_ext):
+    """Recursively index WSI files under wsi_dir -> {lowercase stem: [paths]}.
+
+    用于 wsi_dir 下还存在一层或多层子文件夹（不同子文件夹内存放不同 WSI）的情况。
+    """
+    key = (os.path.abspath(wsi_dir), wsi_ext.lower().lstrip('.'))
+    if key in _WSI_INDEX_CACHE:
+        return _WSI_INDEX_CACHE[key]
+
+    index = {}
+    for root, _, files in os.walk(wsi_dir):
+        for fn in files:
+            stem, ext = os.path.splitext(fn)
+            if ext.lower().lstrip('.') != key[1]:
+                continue
+            index.setdefault(stem.lower(), []).append(os.path.join(root, fn))
+    for k in index:
+        index[k].sort()
+
+    _WSI_INDEX_CACHE[key] = index
+    print(f"[WSI index] found {sum(len(v) for v in index.values())} "
+          f"*.{key[1]} files ({len(index)} unique slide names) under {wsi_dir}")
+    return index
+
+
+def resolve_wsi_path(slide_name, wsi_dir, wsi_ext):
+    """Locate a WSI: try <wsi_dir>/<slide_name>.<ext> first, then recursive index."""
+    direct = os.path.join(wsi_dir, f'{slide_name}.{wsi_ext}')
+    if os.path.exists(direct):
+        return direct
+
+    hits = build_wsi_index(wsi_dir, wsi_ext).get(slide_name.lower(), [])
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        print(f"Warning: '{slide_name}' found in {len(hits)} sub-folders, "
+              f"using the first one: {hits}")
+        return hits[0]
+    return None
+
+
 def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir, 
                        wsi_ext='mrxs', task_idx=0, class_names=None, 
                        num_protos=2, vis_level=3, max_size=1024,
                        save_wsi=True, save_heatmap=True, heatmap_only=False,
-                       save_low=True, save_high=True, shared_scale=False):
+                       save_low=True, save_high=True, shared_scale=False,
+                       step_low=None, step_high=None, attn_mode='prob',
+                       explain='none', occ_grid=16,
+                       occ_patch=False, occ_batch=8, occ_score='logprob'):
     """Process a single WSI."""
     h5_path_s = os.path.join(h5_dir, f'{slide_name}.h5')
     h5_path_l = os.path.join(h5_dir_l, f'{slide_name}.h5')
-    wsi_path = os.path.join(wsi_dir, f'{slide_name}.{wsi_ext}')
-    
+    wsi_path = resolve_wsi_path(slide_name, wsi_dir, wsi_ext)
+
+    if wsi_path is None:
+        print(f"Warning: WSI not found under {wsi_dir} "
+              f"(searched sub-folders too): {slide_name}.{wsi_ext}")
+        return False
+
     for path, name in [(h5_path_s, 'Low-res H5'), (h5_path_l, 'High-res H5'), (wsi_path, 'WSI')]:
         if not os.path.exists(path):
             print(f"Warning: {name} not found: {path}")
@@ -541,8 +738,46 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
     print(f"  Patches: low-res={features_s.shape[0]}, high-res={features_l.shape[0]}", flush=True)
     print(f"  Patch sizes: low-res={patch_size_s} (level={patch_level_s}), high-res={patch_size_l} (level={patch_level_l})", flush=True)
     
+    if explain == 'occlusion':
+        slide_output_dir = os.path.join(output_dir, slide_name)
+        os.makedirs(slide_output_dir, exist_ok=True)
+        processed = False
+        scales = []
+        if save_low:
+            scales.append(('low', '_occ_low', coords_s, patch_size_s, patch_level_s, step_low, save_wsi))
+        if save_high:
+            scales.append(('high', '_occ_high', coords_l, patch_size_l, patch_level_l, step_high, False))
+        for scale, suffix, coords_t, psize, plevel, step, do_save_wsi in scales:
+            if occ_patch:
+                print(f"  [occlusion] scale={scale}, level=patch, "
+                      f"score={occ_score}, batch={occ_batch}", flush=True)
+                scores, base_prob, class_mean_delta = compute_patch_occlusion_scores(
+                    model, features_s, coords_s, features_l, coords_l,
+                    task_idx=task_idx, scale=scale,
+                    batch_size=occ_batch, score=occ_score)
+            else:
+                print(f"  [occlusion] scale={scale}, grid={occ_grid}x{occ_grid}", flush=True)
+                scores, base_prob, class_mean_delta = compute_occlusion_scores(
+                    model, features_s, coords_s, features_l, coords_l,
+                    task_idx=task_idx, scale=scale, grid=occ_grid)
+            num_classes = base_prob.shape[0]
+            names = _get_class_names(class_names, num_classes)
+            pred = int(np.argmax(base_prob))
+            print(f"    pred={pred} ({names[pred]}), prob={np.round(base_prob, 4).tolist()}")
+            print(f"    mean_prob_drop per class={np.round(class_mean_delta, 4).tolist()}")
+            draw_heatmap_per_class(scores, coords_t.cpu().numpy(), wsi_path,
+                                   slide_output_dir, class_names=names, task_idx=task_idx,
+                                   vis_level=vis_level, max_size=max_size,
+                                   save_wsi=do_save_wsi, save_heatmap=save_heatmap,
+                                   heatmap_only=heatmap_only, suffix=suffix,
+                                   patch_size=psize, patch_level=plevel,
+                                   shared_scale=False, step_override=step,
+                                   symmetric=True, attn_mode='prob', cmap='bwr')
+            processed = True
+        return processed
+
     attn_low, attn_high, coords_s, coords_l = get_text_attention(
-        model, features_s, coords_s, features_l, coords_l, task_idx)
+        model, features_s, coords_s, features_l, coords_l, task_idx, attn_mode)
     
     slide_output_dir = os.path.join(output_dir, slide_name)
     os.makedirs(slide_output_dir, exist_ok=True)
@@ -568,6 +803,9 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
         
         if attn_patches is not None:
             attn_patches = attn_patches.cpu().numpy()
+            if attn_mode == 'diff':
+                # 减去跨类均值，消去与类别无关的 q̄·k_j 主导项，只保留类别判别分量
+                attn_patches = attn_patches - attn_patches.mean(axis=0, keepdims=True)
             num_classes = attn_patches.shape[0]
             names = _get_class_names(class_names, num_classes)
             scores = [attn_patches[i] for i in range(num_classes)]
@@ -580,7 +818,9 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
                                    save_wsi=save_wsi, save_heatmap=save_heatmap,
                                    heatmap_only=heatmap_only, suffix='_low',
                                    patch_size=patch_size_s, patch_level=patch_level_s,
-                                   shared_scale=shared_scale)
+                                   shared_scale=shared_scale, step_override=step_low,
+                                   symmetric=(attn_mode == 'diff'), attn_mode=attn_mode,
+                                   cmap=('bwr' if attn_mode == 'diff' else 'jet'))
             processed = True
     elif save_low:
         print("  Warning: No low-res text attention weights captured")
@@ -604,6 +844,8 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
         
         if attn_patches is not None:
             attn_patches = attn_patches.cpu().numpy()
+            if attn_mode == 'diff':
+                attn_patches = attn_patches - attn_patches.mean(axis=0, keepdims=True)
             num_classes = attn_patches.shape[0]
             names = _get_class_names(class_names, num_classes)
             scores = [attn_patches[i] for i in range(num_classes)]
@@ -616,7 +858,9 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
                                    save_wsi=False, save_heatmap=save_heatmap,
                                    heatmap_only=heatmap_only, suffix='_high',
                                    patch_size=patch_size_l, patch_level=patch_level_l,
-                                   shared_scale=shared_scale)
+                                   shared_scale=shared_scale, step_override=step_high,
+                                   symmetric=(attn_mode == 'diff'), attn_mode=attn_mode,
+                                   cmap=('bwr' if attn_mode == 'diff' else 'jet'))
             processed = True
     elif save_high:
         print("  Warning: No high-res text attention weights captured")
@@ -710,7 +954,7 @@ def main():
     parser.add_argument('--model_type', type=str, default='ViLa_MTL_MIL')
     parser.add_argument('--h5_dir', type=str, required=True, help='Low-res H5 dir')
     parser.add_argument('--h5_dir_l', type=str, default=None, help='High-res H5 dir')
-    parser.add_argument('--wsi_dir', type=str, required=True)
+    parser.add_argument('--wsi_dir', type=str, required=True, help='WSI root dir; sub-folders are searched recursively if the file is not directly under this dir')
     parser.add_argument('--wsi_ext', type=str, default='mrxs')
     parser.add_argument('--output_dir', type=str, default='text_attention_results')
     parser.add_argument('--vis_level', type=int, default=3)
@@ -744,7 +988,28 @@ def main():
     parser.add_argument('--shared_scale', action='store_true', default=False,
                         help='Normalize all classes of a slide (same scale) with a shared vmin/vmax '
                              'so cross-class heatmaps are comparable')
-    
+    parser.add_argument('--step_low', type=int, default=None,
+                        help='Override low-res step size in level-0 pixels (e.g. 1024 for TJ 10x)')
+    parser.add_argument('--step_high', type=int, default=None,
+                        help='Override high-res step size in level-0 pixels (e.g. 512 for TJ 20x)')
+    parser.add_argument('--attn_mode', type=str, default='prob', choices=['prob', 'raw', 'diff'],
+                        help='prob=softmax 注意力概率(默认, 与模型计算一致); '
+                             'raw=softmax 前打分(仅调试, 尺度不可解释); '
+                             'diff=跨类去均值差分(展示类别判别区域, 使用 bwr 色标)')
+    parser.add_argument('--explain', type=str, default='none', choices=['none', 'occlusion'],
+                        help='none=文本注意力; occlusion=遮挡归因（与预测类别对齐）')
+    parser.add_argument('--occ_grid', type=int, default=16,
+                        help='遮挡网格边长（grid x grid 块），默认 16')
+    parser.add_argument('--occ_patch', action='store_true', default=False,
+                        help='patch 级遮挡（逐 patch 置零，patch 粒度归因，较慢）')
+    parser.add_argument('--occ_batch', type=int, default=8,
+                        help='patch 级遮挡的批大小，默认 8')
+    parser.add_argument('--occ_score', type=str, default='logprob', choices=['prob', 'logprob'],
+                        help='patch 级遮挡的打分方式：logprob=对数概率差(默认), prob=概率差')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='只固定未加载层的随机初始化；若 checkpoint 完整，改变该值不影响输出，'
+                             '可用来验证图是否依赖随机初始化')
+
     args = parser.parse_args()
     
     text_prompt_file, aux_label_cols = resolve_text_prompt_args(args)
@@ -781,7 +1046,8 @@ def main():
                 
                 model, num_protos = load_model(ckpt_path, args.model_type,
                                                text_prompt_file=text_prompt_file,
-                                               aux_label_cols=aux_label_cols)
+                                               aux_label_cols=aux_label_cols,
+                                               seed=args.seed)
                 
                 fold_output_dir = os.path.join(args.output_dir, f'fold_{fold_id}')
                 
@@ -808,7 +1074,9 @@ def main():
                                          save_wsi=args.save_wsi, save_heatmap=args.save_heatmap,
                                          heatmap_only=args.heatmap_only,
                                          save_low=args.save_low, save_high=args.save_high,
-                                         shared_scale=args.shared_scale):
+                                         shared_scale=args.shared_scale,
+                                         step_low=args.step_low, step_high=args.step_high,
+                                         attn_mode=args.attn_mode, explain=args.explain, occ_grid=args.occ_grid, occ_patch=args.occ_patch, occ_batch=args.occ_batch, occ_score=args.occ_score):
                         success += 1
                 
                 total_success += success
@@ -828,7 +1096,8 @@ def main():
     else:
         model, num_protos = load_model(args.ckpt_path, args.model_type,
                                        text_prompt_file=text_prompt_file,
-                                       aux_label_cols=aux_label_cols)
+                                       aux_label_cols=aux_label_cols,
+                                       seed=args.seed)
         
         if args.slide_ids:
             slide_names = args.slide_ids
@@ -855,7 +1124,9 @@ def main():
                                      save_wsi=args.save_wsi, save_heatmap=args.save_heatmap,
                                      heatmap_only=args.heatmap_only,
                                      save_low=args.save_low, save_high=args.save_high,
-                                     shared_scale=args.shared_scale):
+                                     shared_scale=args.shared_scale,
+                                     step_low=args.step_low, step_high=args.step_high,
+                                     attn_mode=args.attn_mode, explain=args.explain, occ_grid=args.occ_grid, occ_patch=args.occ_patch, occ_batch=args.occ_batch, occ_score=args.occ_score):
                     success += 1
         except KeyboardInterrupt:
             print("\n\nInterrupted by user (Ctrl+C)")

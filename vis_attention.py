@@ -214,8 +214,9 @@ def save_wsi_thumbnail(wsi_path, output_path, vis_level=2, max_size=2048):
 
 
 def draw_heatmap_only(scores, coords, wsi_path, output_path, 
-                      vis_level=2, alpha=0.4, cmap='jet', 
-                      patch_size=256, patch_level=0, max_size=2048):
+                      vis_level=2, alpha=0.4, cmap='jet',
+                      patch_size=256, patch_level=0, max_size=2048,
+                      step_override=None):
     """Draw attention heatmap only (transparent background, no WSI overlay)."""
     import matplotlib.pyplot as plt
     from openslide import OpenSlide
@@ -261,6 +262,8 @@ def draw_heatmap_only(scores, coords, wsi_path, output_path,
             y_step_original = patch_size
         
         step_size_original = max(x_step_original, y_step_original)
+        if step_override is not None:
+            step_size_original = step_override
         vis_patch_size = max(1, int(step_size_original / downsample * scale))
     else:
         vis_patch_size = max(1, int(patch_size * patch_downsample / downsample * scale))
@@ -296,8 +299,9 @@ def draw_heatmap_only(scores, coords, wsi_path, output_path,
     wsi.close()
 
 
-def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir, wsi_ext='mrxs', vis_level=2, max_size=2048, 
-                       save_wsi=True, save_low=True, save_high=True):
+def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir, wsi_ext='mrxs', vis_level=2, max_size=2048,
+                       save_wsi=True, save_low=True, save_high=True,
+                       step_low=None, step_high=None):
     """Process a single WSI."""
     h5_path_s = os.path.join(h5_dir, f'{slide_name}.h5')
     h5_path_l = os.path.join(h5_dir_l, f'{slide_name}.h5')
@@ -330,7 +334,8 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
         output_path = os.path.join(output_dir, f'{slide_name}_heatmap_low.png')
         draw_heatmap_only(attn_scores.reshape(-1, 1), coords_s.cpu().numpy(), wsi_path, output_path,
                           vis_level=vis_level, max_size=max_size,
-                          patch_size=patch_size_s, patch_level=patch_level_s)
+                          patch_size=patch_size_s, patch_level=patch_level_s,
+                          step_override=step_low)
     elif save_low:
         print("Warning: No low-resolution attention weights captured")
     
@@ -341,7 +346,8 @@ def process_single_wsi(model, slide_name, h5_dir, h5_dir_l, wsi_dir, output_dir,
         output_path = os.path.join(output_dir, f'{slide_name}_heatmap_high.png')
         draw_heatmap_only(attn_scores.reshape(-1, 1), coords_l.cpu().numpy(), wsi_path, output_path,
                           vis_level=vis_level, max_size=max_size,
-                          patch_size=patch_size_l, patch_level=patch_level_l)
+                          patch_size=patch_size_l, patch_level=patch_level_l,
+                          step_override=step_high)
     elif save_high:
         print("Warning: No high-resolution attention weights captured")
     
@@ -453,6 +459,10 @@ def main():
     parser.add_argument('--no_save_low', action='store_true', help='Do not save low-resolution heatmap')
     parser.add_argument('--save_high', action='store_true', default=True, help='Save high-resolution heatmap')
     parser.add_argument('--no_save_high', action='store_true', help='Do not save high-resolution heatmap')
+    parser.add_argument('--step_low', type=int, default=None,
+                        help='Override low-res step size in level-0 pixels (e.g. 1024)')
+    parser.add_argument('--step_high', type=int, default=None,
+                        help='Override high-res step size in level-0 pixels (e.g. 512)')
     
     args = parser.parse_args()
     
@@ -519,7 +529,8 @@ def main():
                     print(f"\n[{i+1}/{len(test_slides)}]")
                     if process_single_wsi(model, name, args.h5_dir, args.h5_dir_l, args.wsi_dir, fold_output_dir, args.wsi_ext,
                                          vis_level=args.vis_level, max_size=args.max_size,
-                                         save_wsi=save_wsi, save_low=save_low, save_high=save_high):
+                                         save_wsi=save_wsi, save_low=save_low, save_high=save_high,
+                                         step_low=args.step_low, step_high=args.step_high):
                         success += 1
                 
                 total_success += success
@@ -561,7 +572,8 @@ def main():
                 print(f"\n[{i+1}/{len(slide_names)}]")
                 if process_single_wsi(model, name, args.h5_dir, args.h5_dir_l, args.wsi_dir, args.output_dir, args.wsi_ext,
                                      vis_level=args.vis_level, max_size=args.max_size,
-                                     save_wsi=save_wsi, save_low=save_low, save_high=save_high):
+                                     save_wsi=save_wsi, save_low=save_low, save_high=save_high,
+                                     step_low=args.step_low, step_high=args.step_high):
                     success += 1
         except KeyboardInterrupt:
             print("\n\nInterrupted by user (Ctrl+C)")
